@@ -160,37 +160,119 @@ echo "-- 系统扩展 (System Extensions):"
 systemextensionsctl list 2>/dev/null || info "无法列出系统扩展"
 
 # -----------------------------------------------------------------------------
-section "3. OpenClaw / AI 助手类工具检测"
+section "3. OpenClaw 深度检查 (重点)"
 # -----------------------------------------------------------------------------
-# OpenClaw (原 Clawdbot/Moltbot) 及常见 AI agent 的配置目录与进程
+# OpenClaw (原 Clawdbot/Moltbot): 已知 CVE-2026-25253 (RCE, CVSS 8.8) 和
+# CVE-2026-27487 (macOS 钥匙串集成命令注入); 技能市场 ClawHub 曾发现 300+
+# 恶意技能传播 AMOS (Atomic macOS Stealer) 窃密木马。以下逐项检查。
+
 FOUND_AI=0
-for d in "$REAL_HOME/.openclaw" "$REAL_HOME/.clawdbot" "$REAL_HOME/.moltbot" \
-         "$REAL_HOME/openclaw" "$REAL_HOME/.config/openclaw"; do
+OC_STATE_DIR="${OPENCLAW_STATE_DIR:-$REAL_HOME/.openclaw}"
+
+echo "-- 3.1 安装痕迹与版本:"
+for d in "$OC_STATE_DIR" "$REAL_HOME/.clawdbot" "$REAL_HOME/.moltbot" "/Applications/OpenClaw.app"; do
     if [ -e "$d" ]; then
         FOUND_AI=1
-        warn "发现 AI 助手配置目录: $d"
+        warn "发现 OpenClaw 相关目录/应用: $d"
     fi
 done
+OC_BIN=$(command -v openclaw 2>/dev/null)
+if [ -n "$OC_BIN" ]; then
+    FOUND_AI=1
+    OC_VERSION=$(openclaw --version 2>/dev/null | head -1)
+    warn "openclaw CLI 已安装: $OC_BIN (版本: ${OC_VERSION:-未知})"
+    echo "       CVE-2026-25253 为远程代码执行漏洞, 请确认已升级到 2026 年 2 月之后的修复版本"
+fi
+
+echo ""
+echo "-- 3.2 运行中的进程:"
 AI_PROC=$(ps aux | grep -iE "openclaw|clawdbot|moltbot" | grep -v grep)
 if [ -n "$AI_PROC" ]; then
     FOUND_AI=1
-    warn "发现相关进程正在运行:"
-    echo "$AI_PROC"
-fi
-if [ "$FOUND_AI" = "1" ]; then
-    echo ""
-    echo "  说明: 这类 AI 助手通常拥有执行命令、读写文件、访问网络的权限,"
-    echo "  并且配置文件里往往保存着 API 密钥。如果不再使用, 建议彻底卸载,"
-    echo "  并轮换其中保存过的所有密钥/令牌 (详见 README 第 4 节)。"
+    warn "OpenClaw 相关进程正在运行:"
+    echo "$AI_PROC" | awk '{printf "  PID %s: %s\n", $2, $11}'
 else
-    ok "未发现 OpenClaw 等 AI 助手痕迹"
+    ok "没有 OpenClaw 进程在运行"
 fi
 
-# 泄露风险: 明文密钥文件
 echo ""
-echo "-- 家目录下常见的明文密钥/凭据文件:"
-for f in "$REAL_HOME/.env" "$REAL_HOME/.aws/credentials" "$REAL_HOME/.npmrc" "$REAL_HOME/.netrc"; do
-    [ -f "$f" ] && info "存在 $f (请确认里面的密钥是否还需要, 是否曾被第三方工具读取)"
+echo "-- 3.3 网关端口暴露检查 (最关键的一项):"
+# 默认网关端口 18789; 若绑定 0.0.0.0 或 lan/公网地址 = 高危 (13 万+ 实例因此暴露公网)
+GW_LISTEN=$(lsof -nP -iTCP:18789 -sTCP:LISTEN 2>/dev/null | grep -v "^COMMAND")
+if [ -n "$GW_LISTEN" ]; then
+    FOUND_AI=1
+    echo "$GW_LISTEN"
+    if echo "$GW_LISTEN" | grep -qE "\*:18789|0\.0\.0\.0:18789"; then
+        warn "网关绑定在 0.0.0.0:18789 —— 局域网/公网可直接访问, 极高危! 立即改为 127.0.0.1 或停用"
+    elif echo "$GW_LISTEN" | grep -q "127.0.0.1:18789"; then
+        info "网关只监听本机 127.0.0.1 (相对安全), 但仍需确认已设置访问令牌"
+    else
+        warn "网关监听在非回环地址, 请人工确认: $GW_LISTEN"
+    fi
+else
+    ok "端口 18789 上没有监听 (网关未运行)"
+fi
+# 配置文件中的绑定设置
+OC_CFG="$OC_STATE_DIR/openclaw.json"
+if [ -f "$OC_CFG" ]; then
+    BIND_CFG=$(grep -oE '"bind"[^,}]*' "$OC_CFG" 2>/dev/null)
+    [ -n "$BIND_CFG" ] && info "配置文件中的网关绑定设置: $BIND_CFG"
+fi
+
+echo ""
+echo "-- 3.4 已安装的技能 (Skills) —— ClawHub 曾出现大量恶意技能:"
+SKILLS_DIR=""
+for sd in "$OC_STATE_DIR/skills" "$OC_STATE_DIR/workspace/skills"; do
+    [ -d "$sd" ] && SKILLS_DIR="$sd"
+done
+if [ -n "$SKILLS_DIR" ]; then
+    FOUND_AI=1
+    warn "发现技能目录 $SKILLS_DIR, 已安装的第三方技能如下, 每一个都需要核实来源:"
+    ls -la "$SKILLS_DIR" | grep -v "^total"
+    echo "       安全公司 Koi Security 在 ClawHub 上发现 341 个恶意技能 (其中 335 个传播"
+    echo "       AMOS 窃密木马, 专偷 macOS 钥匙串/浏览器密码/加密货币钱包)。"
+    echo "       凡是你不能 100% 确认来源的技能, 一律按已中招处理 (见 README)。"
+else
+    ok "未发现已安装的第三方技能"
+fi
+
+echo ""
+echo "-- 3.5 明文密钥暴露检查 (不会在报告中打印密钥本身):"
+if [ -d "$OC_STATE_DIR" ]; then
+    KEY_FILES=$(grep -rlE "sk-ant-|sk-[A-Za-z0-9]{20,}|\"(api_?key|token|secret)\"" "$OC_STATE_DIR" 2>/dev/null | head -20)
+    if [ -n "$KEY_FILES" ]; then
+        warn "以下文件中含有疑似明文 API 密钥/令牌 (只列文件名, 不打印内容):"
+        echo "$KEY_FILES" | sed 's/^/       /'
+        echo "       这些密钥应视为已泄露, 全部到对应平台作废并重新生成 (见 README 第 4 节)"
+    else
+        info "$OC_STATE_DIR 中未匹配到明显的明文密钥 (仍建议人工过一遍配置文件)"
+    fi
+fi
+
+echo ""
+echo "-- 3.6 OpenClaw 的 launchd 服务:"
+for label in ai.openclaw.gateway com.openclaw.gateway com.clawdbot.gateway bot.molt.gateway; do
+    if launchctl list 2>/dev/null | grep -q "$label" || [ -f "$REAL_HOME/Library/LaunchAgents/$label.plist" ]; then
+        FOUND_AI=1
+        warn "发现网关服务: $label (卸载命令见 README)"
+    fi
+done
+
+echo ""
+echo "-- 3.7 消息平台接入 (Telegram/WhatsApp/Slack 等 bot token 也需轮换):"
+if [ -d "$OC_STATE_DIR" ]; then
+    grep -rliE "telegram|whatsapp|slack|discord|imessage" "$OC_STATE_DIR" --include="*.json" 2>/dev/null | head -10 | sed 's/^/  /'
+fi
+
+if [ "$FOUND_AI" = "0" ]; then
+    ok "本机未发现任何 OpenClaw 痕迹 (可能已卸载干净, 或安装在别的账户/机器上)"
+fi
+
+# 泄露风险: 家目录其他明文密钥文件 (OpenClaw 有完整文件读取能力, 这些都可能被读过)
+echo ""
+echo "-- 3.8 家目录下其他明文凭据文件 (OpenClaw 能读到的都算暴露面):"
+for f in "$REAL_HOME/.env" "$REAL_HOME/.aws/credentials" "$REAL_HOME/.npmrc" "$REAL_HOME/.netrc" "$REAL_HOME/.ssh/id_rsa" "$REAL_HOME/.ssh/id_ed25519"; do
+    [ -f "$f" ] && info "存在 $f — 若 OpenClaw 曾被入侵或装过恶意技能, 此文件视为已泄露"
 done
 
 # -----------------------------------------------------------------------------
